@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>자전거 무전기</title>
+<style>
+  :root { --bg:#eef1f4; --ink:#14232e; --idle:#0e7c86; --live:#ff6a1a; --off:#5b6b77; --mute:#5b6b77; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--ink); font-family: system-ui, -apple-system, "Noto Sans KR", sans-serif;
+         display: flex; flex-direction: column; padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom); }
+  h1 { font-size: 1.3rem; margin: 16px 0 4px; }
+  #status { color: var(--mute); margin: 0 0 12px; min-height: 1.4em; }
+  #setup { display: flex; flex-direction: column; gap: 12px; }
+  button, input[type=text], input[type=tel] { font: inherit; border-radius: 14px; border: 2px solid var(--ink); padding: 16px; }
+  button { background: var(--ink); color: #fff; font-weight: 700; }
+  #codeInput { text-align: center; font-size: 1.6rem; letter-spacing: .3em; background: #fff; }
+  #talk-screen { display: none; flex: 1; flex-direction: column; gap: 12px; padding-bottom: 16px; }
+  #top { display: flex; justify-content: space-between; align-items: baseline; }
+  #code { font-size: 2rem; font-weight: 800; letter-spacing: .15em; margin: 0; }
+  #count { font-weight: 700; }
+  #mic { flex: 1; border: 0; background: var(--idle); font-size: 1.8rem; border-radius: 28px;
+         user-select: none; -webkit-user-select: none; transition: background .08s, box-shadow .08s; }
+  #mic.speaking { background: var(--live); box-shadow: 0 0 0 10px rgba(255,106,26,.3); }
+  #mic.off { background: var(--off); }
+  .row { display: flex; gap: 10px; align-items: center; font-weight: 600; }
+  .row input[type=checkbox] { width: 24px; height: 24px; }
+  .row input[type=range] { flex: 1; }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--live); outline-offset: 2px; }
+</style>
+</head>
+<body>
+  <h1>자전거 무전기</h1>
+  <p id="status">방을 만들거나 코드를 입력하세요.</p>
+
+  <section id="setup">
+    <button id="make">방 만들기</button>
+    <input id="codeInput" type="tel" inputmode="numeric" maxlength="4" placeholder="0000" aria-label="방 코드 4자리">
+    <button id="join">코드로 입장</button>
+  </section>
+
+  <section id="talk-screen">
+    <div id="top"><p id="code"></p><span id="count"></span></div>
+    <button id="mic">말하면 자동 전송</button>
+    <div class="row"><input type="checkbox" id="vad" checked><label for="vad">말할 때만 전송 (바람 소리 줄이기)</label></div>
+    <div class="row"><label for="sens">민감도</label><input type="range" id="sens" min="1" max="10" value="5"></div>
+  </section>
+
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+/* ===== 설정: 안정성을 높이려면 여기를 바꾸세요 =====
+   1) SIGNAL: 본인 PeerJS 서버를 띄웠다면 host/port/path/secure를 바꾸세요.
+   2) ICE: TURN 서버를 추가하면 LTE/5G에서 연결 성공률이 크게 올라가요.
+      예) { urls: "turn:turn.example.com:443?transport=tcp", username: "...", credential: "..." } */
+const SIGNAL = { host: "0.peerjs.com", port: 443, path: "/", secure: true };
+const ICE = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" }
+];
+/* ================================================== */
+
+const $ = id => document.getElementById(id);
+const PREFIX = "bikechat-";
+const setStatus = t => $("status").textContent = t;
+
+let peer, rawStream, outStream, ctx, gain, analyser;
+let role, room, hostId, wakeLock;
+let micOn = true, holdUntil = 0;
+const calls = new Map();   // peerId -> call
+const audios = new Map();  // peerId -> Audio
+const known = new Set();   // 다시 연결을 시도할 상대들
+let hostConns = new Map(); // (방장 전용) peerId -> data connection
+
+/* ---------- 마이크 + 음성 감지(말하는 순간 바로 전송, 첫 음절 안 잘림) ---------- */
+async function setupAudio() {
+  rawStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+  });
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume();
+  const src = ctx.createMediaStreamSource(rawStream);
+  analyser = ctx.createAnalyser();
+  analyser.fftSize = 1024;
+  const delay = ctx.createDelay(0.5);
+  delay.delayTime.value = 0.12; // 감지 전 소리를 살짝 지연시켜 앞부분이 잘리지 않게 함
+  gain = ctx.createGain();
+  const dest = ctx.createMediaStreamDestination();
+  src.connect(analyser);
+  src.connect(delay); delay.connect(gain); gain.connect(dest);
+  outStream = dest.stream;
+  setInterval(gateLoop, 40);
+}
+
+function gateLoop() {
+  const buf = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(buf);
+  let sum = 0;
+  for (const v of buf) sum += v * v;
+  const rms = Math.sqrt(sum / buf.length);
+  const threshold = 0.004 + (11 - $("sens").value) * 0.004; // 민감도 높을수록 낮은 문턱
+  const now = performance.now();
+  if (rms > threshold) holdUntil = now + 700;
+  const speaking = micOn && (!$("vad").checked || now < holdUntil);
+  gain.gain.setTargetAtTime(speaking ? 1 : 0, ctx.currentTime, 0.015);
+  const mic = $("mic");
+  mic.classList.toggle("speaking", speaking && $("vad").checked);
+  mic.classList.toggle("off", !micOn);
+  mic.textContent = !micOn ? "마이크 꺼짐 (눌러서 켜기)"
+                  : $("vad").checked ? "말하면 자동 전송" : "마이크 켜짐";
+}
+$("mic").onclick = () => { micOn = !micOn; };
+
+/* ---------- 화면 꺼짐 방지 ---------- */
+async function keepAwake() { try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {} }
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && role) { keepAwake(); ctx && ctx.resume(); }
+});
+
+/* ---------- 연결 (모두가 서로 연결되는 메시 방식) ---------- */
+function updateCount() { $("count").textContent = "참가자 " + (calls.size + 1) + "명"; }
+
+function attachCall(call) {
+  const id = call.peer;
+  calls.set(id, call);
+  call.on("stream", remote => {
+    let a = audios.get(id);
+    if (!a) { a = new Audio(); audios.set(id, a); }
+    a.srcObject = remote;
+    a.play().catch(() => {});
+    setStatus("연결됨");
+    updateCount();
+  });
+  const lost = () => {
+    if (calls.get(id) === call) calls.delete(id);
+    audios.delete(id);
+    updateCount();
+    if (known.has(id)) { setStatus("끊김. 다시 연결 중…"); setTimeout(() => redial(id), 3000); }
+  };
+  call.on("close", lost);
+  call.on("error", lost);
+}
+
+// 먼저 들어온 쪽이 아니라 '새로 들어온 쪽'이 전화를 거는 규칙이라, 재연결도 건 쪽만 시도해요.
+const callers = new Set();
+function dial(id) {
+  known.add(id); callers.add(id);
+  if (calls.has(id)) return;
+  attachCall(peer.call(id, outStream));
+}
+function redial(id) {
+  if (!known.has(id) || !callers.has(id) || calls.has(id) || !peer || peer.destroyed) return;
+  if (peer.disconnected) peer.reconnect();
+  attachCall(peer.call(id, outStream));
+  // 응답이 없으면 다시 시도
+  setTimeout(() => { if (known.has(id) && !calls.get(id)?.open) { calls.delete(id); redial(id); } }, 5000);
+}
+
+function makePeer(id) {
+  peer = new Peer(id, { ...SIGNAL, config: { iceServers: ICE } });
+  peer.on("disconnected", () => setTimeout(() => peer.destroyed || peer.reconnect(), 1000));
+  peer.on("call", call => {                 // 누가 전화 걸어오면 내 소리를 붙여서 받음
+    known.add(call.peer);
+    call.answer(outStream);
+    attachCall(call);
+  });
+  return peer;
+}
+
+function showTalkScreen() {
+  $("setup").style.display = "none";
+  $("talk-screen").style.display = "flex";
+  $("code").textContent = "방 " + room;
+  updateCount();
+  keepAwake();
+}
+
+/* 방장: 접속자 명단을 관리하고, 새로 온 사람에게 기존 참가자 목록을 알려줌 */
+function hostLogic() {
+  peer.on("connection", conn => {
+    conn.on("open", () => {
+      const existing = [peer.id, ...hostConns.keys()];
+      conn.send({ type: "roster", ids: existing });
+      hostConns.set(conn.peer, conn);
+    });
+    conn.on("close", () => {
+      hostConns.delete(conn.peer);
+      known.delete(conn.peer);
+      hostConns.forEach(c => c.send({ type: "left", id: conn.peer }));
+    });
+  });
+}
+
+/* 손님: 방장에게 접속해서 명단을 받고, 명단의 모두에게 전화 */
+function joinLogic() {
+  const conn = peer.connect(hostId, { reliable: true });
+  let gotRoster = false;
+  conn.on("data", msg => {
+    if (msg.type === "roster" && !gotRoster) { gotRoster = true; msg.ids.forEach(dial); setStatus("연결 중…"); }
+    if (msg.type === "left") { known.delete(msg.id); callers.delete(msg.id); }
+  });
+  const retry = () => {
+    if (peer.destroyed || gotRoster) return;
+    setStatus("방을 찾는 중…");
+    setTimeout(() => { if (!gotRoster) { try { conn.close(); } catch (e) {} joinLogic(); } }, 3000);
+  };
+  conn.on("error", retry);
+  peer.once("error", err => { if (err.type === "peer-unavailable") retry(); });
+}
+
+$("make").onclick = async () => {
+  try { await setupAudio(); } catch (e) { return setStatus("마이크 권한을 허용해 주세요."); }
+  role = "host";
+  room = String(Math.floor(1000 + Math.random() * 9000));
+  makePeer(PREFIX + room);
+  peer.on("open", () => { showTalkScreen(); setStatus("친구에게 코드를 알려주세요."); hostLogic(); });
+  peer.on("error", err => {
+    if (err.type === "unavailable-id") { peer.destroy(); $("make").click(); }
+    else setStatus("오류: " + err.type);
+  });
+};
+
+$("join").onclick = async () => {
+  const code = $("codeInput").value.trim();
+  if (!/^\d{4}$/.test(code)) return setStatus("코드는 숫자 4자리예요.");
+  try { await setupAudio(); } catch (e) { return setStatus("마이크 권한을 허용해 주세요."); }
+  role = "guest"; room = code; hostId = PREFIX + code;
+  makePeer();
+  peer.on("open", () => { showTalkScreen(); setStatus("연결 중…"); joinLogic(); });
+  peer.on("error", err => { if (err.type !== "peer-unavailable") setStatus("오류: " + err.type); });
+};
+</script>
+</body>
+</html>

@@ -27,6 +27,10 @@
   .row { display: flex; gap: 10px; align-items: center; font-weight: 600; }
   .row input[type=checkbox] { width: 24px; height: 24px; }
   .row input[type=range] { flex: 1; }
+  #people { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+  #people li { background: #fff; border: 2px solid var(--ink); border-radius: 999px; padding: 6px 14px; font-weight: 700; }
+  #people li.me { background: var(--ink); color: #fff; }
+  #nameInput { text-align: center; background: #fff; }
   button:focus-visible, input:focus-visible { outline: 3px solid var(--live); outline-offset: 2px; }
 </style>
 </head>
@@ -35,6 +39,7 @@
   <p id="status">방을 만들거나 코드를 입력하세요.</p>
 
   <section id="setup">
+    <input id="nameInput" type="text" maxlength="10" placeholder="내 이름 (친구들에게 보여요)" aria-label="내 이름">
     <button id="make">방 만들기</button>
     <input id="codeInput" type="tel" inputmode="numeric" maxlength="4" placeholder="0000" aria-label="방 코드 4자리">
     <button id="join">코드로 입장</button>
@@ -42,6 +47,7 @@
 
   <section id="talk-screen">
     <div id="top"><p id="code"></p><span id="count"></span></div>
+    <ul id="people" aria-label="참가자 목록"></ul>
     <button id="mic">말하면 자동 전송</button>
     <div class="row"><input type="checkbox" id="vad" checked><label for="vad">말할 때만 전송 (바람 소리 줄이기)</label></div>
     <div class="row"><label for="sens">민감도</label><input type="range" id="sens" min="1" max="10" value="5"></div>
@@ -71,6 +77,14 @@ const calls = new Map();   // peerId -> call
 const audios = new Map();  // peerId -> Audio
 const known = new Set();   // 다시 연결을 시도할 상대들
 let hostConns = new Map(); // (방장 전용) peerId -> data connection
+const names = new Map();   // peerId -> 이름
+let myName = "";
+const cleanName = n => String(n || "").trim().slice(0, 10) || "이름 없음";
+function readName() {
+  myName = cleanName($("nameInput").value || "참가자" + Math.floor(10 + Math.random() * 90));
+  try { localStorage.setItem("bikeName", myName); } catch (e) {}
+}
+try { $("nameInput").value = localStorage.getItem("bikeName") || ""; } catch (e) {}
 
 /* ---------- 마이크 + 음성 감지(말하는 순간 바로 전송, 첫 음절 안 잘림) ---------- */
 async function setupAudio() {
@@ -118,24 +132,33 @@ document.addEventListener("visibilitychange", () => {
 });
 
 /* ---------- 연결 (모두가 서로 연결되는 메시 방식) ---------- */
-function updateCount() { $("count").textContent = "참가자 " + (calls.size + 1) + "명"; }
+function updateCount() {
+  $("count").textContent = "참가자 " + (calls.size + 1) + "명";
+  const ul = $("people");
+  ul.innerHTML = "";
+  const add = (text, cls) => { const li = document.createElement("li"); li.textContent = text; if (cls) li.className = cls; ul.appendChild(li); };
+  add(myName + " (나)", "me");
+  calls.forEach((c, id) => add(names.get(id) || "이름 없음"));
+}
 
 function attachCall(call) {
   const id = call.peer;
   calls.set(id, call);
   call.on("stream", remote => {
     let a = audios.get(id);
+    const isNew = !a;
     if (!a) { a = new Audio(); audios.set(id, a); }
     a.srcObject = remote;
     a.play().catch(() => {});
-    setStatus("연결됨");
+    setStatus(isNew ? (names.get(id) || "누군가") + "님이 들어왔어요" : "연결됨");
     updateCount();
   });
   const lost = () => {
     if (calls.get(id) === call) calls.delete(id);
     audios.delete(id);
     updateCount();
-    if (known.has(id)) { setStatus("끊김. 다시 연결 중…"); setTimeout(() => redial(id), 3000); }
+    if (known.has(id)) { setStatus((names.get(id) || "누군가") + "님과 끊김. 다시 연결 중…"); setTimeout(() => redial(id), 3000); }
+    else setStatus((names.get(id) || "누군가") + "님이 나갔어요");
   };
   call.on("close", lost);
   call.on("error", lost);
@@ -143,15 +166,17 @@ function attachCall(call) {
 
 // 먼저 들어온 쪽이 아니라 '새로 들어온 쪽'이 전화를 거는 규칙이라, 재연결도 건 쪽만 시도해요.
 const callers = new Set();
-function dial(id) {
+function dial(p) {
+  const id = p.id;
+  names.set(id, cleanName(p.name));
   known.add(id); callers.add(id);
   if (calls.has(id)) return;
-  attachCall(peer.call(id, outStream));
+  attachCall(peer.call(id, outStream, { metadata: { name: myName } }));
 }
 function redial(id) {
   if (!known.has(id) || !callers.has(id) || calls.has(id) || !peer || peer.destroyed) return;
   if (peer.disconnected) peer.reconnect();
-  attachCall(peer.call(id, outStream));
+  attachCall(peer.call(id, outStream, { metadata: { name: myName } }));
   // 응답이 없으면 다시 시도
   setTimeout(() => { if (known.has(id) && !calls.get(id)?.open) { calls.delete(id); redial(id); } }, 5000);
 }
@@ -161,6 +186,7 @@ function makePeer(id) {
   peer.on("disconnected", () => setTimeout(() => peer.destroyed || peer.reconnect(), 1000));
   peer.on("call", call => {                 // 누가 전화 걸어오면 내 소리를 붙여서 받음
     known.add(call.peer);
+    names.set(call.peer, cleanName(call.metadata && call.metadata.name));
     call.answer(outStream);
     attachCall(call);
   });
@@ -178,8 +204,9 @@ function showTalkScreen() {
 /* 방장: 접속자 명단을 관리하고, 새로 온 사람에게 기존 참가자 목록을 알려줌 */
 function hostLogic() {
   peer.on("connection", conn => {
+    names.set(conn.peer, cleanName(conn.metadata && conn.metadata.name));
     conn.on("open", () => {
-      const existing = [peer.id, ...hostConns.keys()];
+      const existing = [{ id: peer.id, name: myName }, ...[...hostConns.keys()].map(id => ({ id, name: names.get(id) }))];
       conn.send({ type: "roster", ids: existing });
       hostConns.set(conn.peer, conn);
     });
@@ -193,7 +220,7 @@ function hostLogic() {
 
 /* 손님: 방장에게 접속해서 명단을 받고, 명단의 모두에게 전화 */
 function joinLogic() {
-  const conn = peer.connect(hostId, { reliable: true });
+  const conn = peer.connect(hostId, { reliable: true, metadata: { name: myName } });
   let gotRoster = false;
   conn.on("data", msg => {
     if (msg.type === "roster" && !gotRoster) { gotRoster = true; msg.ids.forEach(dial); setStatus("연결 중…"); }
@@ -210,6 +237,7 @@ function joinLogic() {
 
 $("make").onclick = async () => {
   try { await setupAudio(); } catch (e) { return setStatus("마이크 권한을 허용해 주세요."); }
+  readName();
   role = "host";
   room = String(Math.floor(1000 + Math.random() * 9000));
   makePeer(PREFIX + room);
@@ -224,6 +252,7 @@ $("join").onclick = async () => {
   const code = $("codeInput").value.trim();
   if (!/^\d{4}$/.test(code)) return setStatus("코드는 숫자 4자리예요.");
   try { await setupAudio(); } catch (e) { return setStatus("마이크 권한을 허용해 주세요."); }
+  readName();
   role = "guest"; room = code; hostId = PREFIX + code;
   makePeer();
   peer.on("open", () => { showTalkScreen(); setStatus("연결 중…"); joinLogic(); });
